@@ -266,6 +266,57 @@ a.file-link:hover{color:var(--oxblood); border-color:var(--oxblood);}
   cursor:pointer;
 }
 .reset-row button:hover{color:var(--oxblood);}
+
+.sync-btn{
+  font-family:'IBM Plex Mono', monospace;
+  font-size:0.7rem;
+  text-transform:uppercase;
+  letter-spacing:0.04em;
+  color:var(--slate);
+  background:none;
+  border:none;
+  cursor:pointer;
+  padding:0;
+  text-decoration:underline;
+}
+.sync-btn:hover{color:var(--oxblood);}
+.sync-status{display:flex; align-items:center; gap:10px;}
+.sync-dot{
+  width:7px; height:7px; border-radius:50%;
+  background:var(--rule);
+  display:inline-block;
+}
+.sync-dot.on{background:var(--sage);}
+.sync-dot.err{background:var(--oxblood);}
+
+.sync-panel{
+  background:var(--paper-raised);
+  border:1px solid var(--rule);
+  border-left:3px solid var(--slate);
+  padding:20px 22px;
+  margin-bottom:18px;
+}
+.sync-panel h2{
+  font-size:1rem;
+  margin:0 0 6px;
+}
+.sync-panel p{
+  font-size:0.85rem;
+  line-height:1.55;
+  color:var(--ink-soft);
+  margin:0 0 14px;
+}
+.sync-panel p.small{font-size:0.75rem;}
+.sync-panel a{color:var(--slate);}
+.sync-msg{
+  font-family:'IBM Plex Mono', monospace;
+  font-size:0.72rem;
+  padding:8px 10px;
+  margin-bottom:14px;
+  border:1px solid var(--rule);
+}
+.sync-msg.err{color:var(--oxblood); border-color:var(--oxblood);}
+.sync-msg.ok{color:var(--sage); border-color:var(--sage);}
 </style>
 </head>
 <body>
@@ -286,9 +337,127 @@ const STATUS_META = {
   'done':       {label:'Done',                cls:'s-done'},
 };
 const STORAGE_KEY = 'docket:projects';
+const SYNC_KEY = 'docket:sync-config';
+const GIST_FILENAME = 'docket.json';
 let projects = [];
 let editingId = null;
 let addingNew = false;
+let showSyncPanel = false;
+let syncState = 'off'; // off | ok | err
+let syncMessage = '';
+let syncBusy = false;
+
+function getSyncConfig(){
+  try{
+    const raw = localStorage.getItem(SYNC_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ return null; }
+}
+
+function setSyncConfig(cfg){
+  if(cfg) localStorage.setItem(SYNC_KEY, JSON.stringify(cfg));
+  else localStorage.removeItem(SYNC_KEY);
+}
+
+async function ghRequest(url, options={}){
+  const cfg = getSyncConfig();
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${cfg.token}`,
+      'Accept': 'application/vnd.github+json',
+      ...(options.headers || {})
+    }
+  });
+  if(!res.ok){
+    const body = await res.text().catch(() => '');
+    throw new Error(`GitHub API ${res.status}: ${res.statusText}${body ? ' — ' + body.slice(0,200) : ''}`);
+  }
+  return res.json();
+}
+
+async function connectSync(token, gistId){
+  syncBusy = true;
+  syncMessage = '';
+  showSyncPanel = true;
+  render();
+  try{
+    setSyncConfig({token, gistId: gistId || null});
+
+    if(gistId){
+      const gist = await ghRequest(`https://api.github.com/gists/${gistId}`);
+      const file = gist.files && gist.files[GIST_FILENAME];
+      if(!file) throw new Error(`Gist found, but has no ${GIST_FILENAME} file.`);
+      projects = JSON.parse(file.content);
+      await saveProjects();
+    } else {
+      const gist = await ghRequest('https://api.github.com/gists', {
+        method: 'POST',
+        body: JSON.stringify({
+          description: 'Docket — semester writing tracker data',
+          public: false,
+          files: { [GIST_FILENAME]: { content: JSON.stringify(projects, null, 2) } }
+        })
+      });
+      setSyncConfig({token, gistId: gist.id});
+    }
+
+    syncState = 'ok';
+    syncMessage = 'Connected. Synced just now.';
+  }catch(e){
+    syncState = 'err';
+    syncMessage = e.message || 'Could not connect.';
+    setSyncConfig(null); // don't leave a broken config that fails silently on every future load
+  }
+  syncBusy = false;
+  render();
+}
+
+function disconnectSync(){
+  setSyncConfig(null);
+  syncState = 'off';
+  syncMessage = '';
+  render();
+}
+
+async function syncPull(){
+  const cfg = getSyncConfig();
+  if(!cfg || !cfg.gistId) return;
+  syncBusy = true; render();
+  try{
+    const gist = await ghRequest(`https://api.github.com/gists/${cfg.gistId}`);
+    const file = gist.files && gist.files[GIST_FILENAME];
+    if(file){
+      projects = JSON.parse(file.content);
+      await saveProjects(false);
+    }
+    syncState = 'ok';
+    syncMessage = 'Synced just now.';
+  }catch(e){
+    syncState = 'err';
+    syncMessage = e.message || 'Sync failed.';
+  }
+  syncBusy = false;
+  render();
+}
+
+async function syncPush(){
+  const cfg = getSyncConfig();
+  if(!cfg || !cfg.gistId) return;
+  try{
+    await ghRequest(`https://api.github.com/gists/${cfg.gistId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        files: { [GIST_FILENAME]: { content: JSON.stringify(projects, null, 2) } }
+      })
+    });
+    syncState = 'ok';
+    syncMessage = 'Synced just now.';
+  }catch(e){
+    syncState = 'err';
+    syncMessage = e.message || 'Sync failed — saved locally only.';
+  }
+}
 
 const seed = () => ([
   {
@@ -351,19 +520,30 @@ async function loadProjects(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
     projects = raw ? JSON.parse(raw) : seed();
-    if(!raw) await saveProjects();
+    if(!raw) await saveProjects(false);
   }catch(e){
     projects = seed();
-    await saveProjects();
+    await saveProjects(false);
+  }
+
+  const cfg = getSyncConfig();
+  if(cfg && cfg.gistId){
+    render(); // show local data immediately, then refresh from gist
+    await syncPull();
+    return;
   }
   render();
 }
 
-async function saveProjects(){
+async function saveProjects(pushToGist = true){
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
   }catch(e){
     console.error('Save failed', e);
+  }
+  const cfg = getSyncConfig();
+  if(pushToGist && cfg && cfg.gistId){
+    await syncPush();
   }
 }
 
@@ -446,6 +626,63 @@ function editFormHtml(p){
   `;
 }
 
+function syncPanelHtml(){
+  const cfg = getSyncConfig();
+  const connected = !!(cfg && cfg.gistId);
+  const gistUrl = connected ? `https://gist.github.com/${cfg.gistId}` : '';
+  const tokenUrl = 'https://github.com/settings/tokens/new?scopes=gist&description=Docket%20sync';
+
+  return `
+    <div class="sync-panel">
+      <h2>${connected ? 'Sync connected' : 'Set up cross-device sync'}</h2>
+      ${!connected ? `
+        <p>Docket will store your data in a private GitHub Gist. Create a personal access token scoped
+        <strong>only to "gist"</strong> — it can't touch your repos or anything else.</p>
+        <p class="small"><a href="${tokenUrl}" target="_blank" rel="noopener">Create a token on GitHub →</a>
+        Then paste it below. On your first device, leave "Gist ID" blank — Docket will create the gist and
+        show you the ID to reuse on other devices.</p>
+      ` : `
+        <p>Your data lives in <a href="${gistUrl}" target="_blank" rel="noopener">this private gist</a>.
+        On another device, paste the same token and this Gist ID:</p>
+        <p class="small"><code>${cfg.gistId}</code></p>
+      `}
+      ${syncMessage ? `<div class="sync-msg ${syncState==='err'?'err':'ok'}">${escapeHtml(syncMessage)}</div>` : ''}
+      ${!connected ? `
+        <div class="field">
+          <label>Personal access token</label>
+          <input id="sync-token" type="password" placeholder="ghp_...">
+        </div>
+        <div class="field">
+          <label>Gist ID (leave blank on first device)</label>
+          <input id="sync-gistid" placeholder="optional">
+        </div>
+        <div class="form-actions">
+          <button class="btn" ${syncBusy?'disabled':''} onclick="handleConnectClick()">${syncBusy ? 'Connecting…' : 'Connect'}</button>
+          <button class="btn ghost" onclick="toggleSyncPanel()">Cancel</button>
+        </div>
+      ` : `
+        <div class="form-actions">
+          <button class="btn" ${syncBusy?'disabled':''} onclick="syncPull().then(render)">${syncBusy ? 'Syncing…' : 'Sync now'}</button>
+          <button class="btn ghost" onclick="disconnectSync()">Disconnect this device</button>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+function handleConnectClick(){
+  const token = document.getElementById('sync-token').value.trim();
+  const gistId = document.getElementById('sync-gistid').value.trim();
+  if(!token) return;
+  connectSync(token, gistId);
+}
+
+function toggleSyncPanel(){
+  showSyncPanel = !showSyncPanel;
+  syncMessage = '';
+  render();
+}
+
 function render(){
   const app = document.getElementById('app');
   const sorted = [...projects];
@@ -465,6 +702,11 @@ function render(){
 
   const addButtonHtml = addingNew ? '' : `<button class="add-toggle" onclick="startAdd()">+ Add a project</button>`;
 
+  const cfg = getSyncConfig();
+  const connected = !!(cfg && cfg.gistId);
+  const dotClass = connected ? (syncState === 'err' ? 'err' : 'on') : '';
+  const statusLabel = connected ? (syncState === 'err' ? 'Sync error' : 'Synced via GitHub') : 'Saved in this browser only';
+
   app.innerHTML = `
     <header>
       <h1>Docket</h1>
@@ -472,8 +714,13 @@ function render(){
     </header>
     <div class="meta-row">
       <span>Semester writing tracker</span>
-      <span>Saved in this browser only</span>
+      <span class="sync-status">
+        <span class="sync-dot ${dotClass}"></span>
+        <span>${statusLabel}</span>
+        <button class="sync-btn" onclick="toggleSyncPanel()">${connected ? 'Manage' : 'Set up sync'}</button>
+      </span>
     </div>
+    ${showSyncPanel ? syncPanelHtml() : ''}
     ${cardsHtml}
     ${addButtonHtml}
     <div class="reset-row">
